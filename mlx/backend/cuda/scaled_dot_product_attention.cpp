@@ -346,6 +346,14 @@ bool supports_sdpa_cudnn(
     return false;
   }
 
+  // cuDNN below 9.6.0 requires s_q and s_kv to be multiples of 64 for
+  // bottom-right causal mask.
+//#if CUDNN_VERSION < 90600
+  if (do_causal && (q.shape(2) % 64 != 0 || k.shape(2) % 64 != 0)) {
+    return false;
+  }
+//#endif
+
   // D_qk and D_v must be a multiple of 8 with maximum value 128.
   if ((q.shape(-1) % 8 != 0) || (q.shape(-1) > 128) || (v.shape(-1) % 8 != 0) ||
       (v.shape(-1) > 128)) {
