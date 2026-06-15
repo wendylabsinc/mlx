@@ -62,7 +62,7 @@ bool supports_managed_memory() {
       // Empirically on Windows (and WSL) if there is no concurrentManagedAccess
       // the managed memory also does not work.
       if (!d.concurrent_managed_access()) {
-        printf("PPP: HIT1\n");
+        printf("GAB: hit allocator cond 1\n");
         return false;
       }
     }

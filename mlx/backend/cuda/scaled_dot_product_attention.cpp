@@ -348,8 +348,12 @@ bool supports_sdpa_cudnn(
 
   // cuDNN below 9.6.0 requires s_q and s_kv to be multiples of 64 for
   // bottom-right causal mask.
+#if CUDNN_VERSION < 90600
+  printf("GAB: hit cuDNN cond 1\n");
+#endif
 //#if CUDNN_VERSION < 90600
   if (do_causal && (q.shape(2) % 64 != 0 || k.shape(2) % 64 != 0)) {
+    printf("GAB: hit cuDNN cond 2\n");
     return false;
   }
 //#endif
