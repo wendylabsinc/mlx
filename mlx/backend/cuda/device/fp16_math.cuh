@@ -4,6 +4,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda/std/cmath>
 #include <cuda/std/type_traits>
 
 namespace mlx::core::cu {
@@ -28,6 +29,63 @@ MLX_DEFINE_BINARY_OP(max, __hmax)
 MLX_DEFINE_BINARY_OP(min, __hmin)
 
 #undef MLX_DEFINE_BINARY_OP
+
+///////////////////////////////////////////////////////////////////////////////
+// Float-promoting math for half types.
+//
+// CUDA 13's CCCL has no unambiguous cuda::std overloads of these math functions
+// for __half/__nv_bfloat16: the arguments convert to both float and (long)
+// double, so the call is ambiguous. These templates provide an exact match for
+// the half types (which beats the converting overloads), compute in float, and
+// cast back; for every other type they defer to cuda::std so float/double
+// precision is preserved.
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename T>
+constexpr bool is_half_v =
+    cuda::std::is_same_v<T, __half> || cuda::std::is_same_v<T, __nv_bfloat16>;
+
+template <typename T>
+__forceinline__ __device__ bool isnan(T x) {
+  if constexpr (is_half_v<T>) {
+    return cuda::std::isnan(static_cast<float>(x));
+  } else {
+    return cuda::std::isnan(x);
+  }
+}
+
+#define MLX_DEFINE_FP_UNARY(NAME)                                  \
+  template <typename T>                                            \
+  __forceinline__ __device__ T NAME(T x) {                        \
+    if constexpr (is_half_v<T>) {                                  \
+      return static_cast<T>(cuda::std::NAME(static_cast<float>(x))); \
+    } else {                                                       \
+      return cuda::std::NAME(x);                                   \
+    }                                                              \
+  }
+
+MLX_DEFINE_FP_UNARY(trunc)
+MLX_DEFINE_FP_UNARY(exp)
+MLX_DEFINE_FP_UNARY(log1p)
+
+#undef MLX_DEFINE_FP_UNARY
+
+#define MLX_DEFINE_FP_BINARY(NAME)                                          \
+  template <typename T>                                                     \
+  __forceinline__ __device__ T NAME(T x, T y) {                            \
+    if constexpr (is_half_v<T>) {                                           \
+      return static_cast<T>(                                                \
+          cuda::std::NAME(static_cast<float>(x), static_cast<float>(y)));   \
+    } else {                                                                \
+      return cuda::std::NAME(x, y);                                         \
+    }                                                                       \
+  }
+
+MLX_DEFINE_FP_BINARY(fmod)
+MLX_DEFINE_FP_BINARY(pow)
+MLX_DEFINE_FP_BINARY(atan2)
+
+#undef MLX_DEFINE_FP_BINARY
 
 ///////////////////////////////////////////////////////////////////////////////
 // Additional C++ operator overrides between half types and native types.
