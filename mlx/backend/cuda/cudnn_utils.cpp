@@ -102,8 +102,20 @@ fe::error_t DnnGraph::autotune_plans(
   // Time all built plans with the real inputs and select the fastest. Runs
   // eagerly on the stream (NOT inside CUDA-graph capture), so call this before
   // encode_capturing, once per shape (the result is held by the conv cache).
+  //
+  // get_autotune_workspace_size() sums the workspace of every built candidate
+  // plan; for large fp32 convs this can exceed device memory and the workspace
+  // allocation throws (cudaMallocAsync out of memory). If that happens, skip
+  // autotuning for this shape and fall back to the heuristic plan already
+  // selected by build_plans() — correct, just not benchmarked. fp16 convs have
+  // small workspaces and are unaffected.
   int64_t workspace_size = get_autotune_workspace_size();
-  void* workspace_ptr = allocate_workspace(encoder, workspace_size);
+  void* workspace_ptr = nullptr;
+  try {
+    workspace_ptr = allocate_workspace(encoder, workspace_size);
+  } catch (const std::exception&) {
+    return {};
+  }
   cudnnSetStream(handle_, encoder.stream());
   return autotune(handle_, variant_pack, workspace_ptr);
 }
