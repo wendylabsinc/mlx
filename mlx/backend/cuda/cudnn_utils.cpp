@@ -109,15 +109,16 @@ fe::error_t DnnGraph::autotune_plans(
   // autotuning for this shape and fall back to the heuristic plan already
   // selected by build_plans() — correct, just not benchmarked. fp16 convs have
   // small workspaces and are unaffected.
-  int64_t workspace_size = get_autotune_workspace_size();
-  void* workspace_ptr = nullptr;
   try {
-    workspace_ptr = allocate_workspace(encoder, workspace_size);
+    int64_t workspace_size = get_autotune_workspace_size();
+    void* workspace_ptr = allocate_workspace(encoder, workspace_size);
+    cudnnSetStream(handle_, encoder.stream());
+    return autotune(handle_, variant_pack, workspace_ptr);
   } catch (const std::exception&) {
+    // OOM (or any failure) during autotuning: keep the heuristic plan already
+    // selected by build_plans(). Correct, just not benchmarked.
     return {};
   }
-  cudnnSetStream(handle_, encoder.stream());
-  return autotune(handle_, variant_pack, workspace_ptr);
 }
 
 fe::error_t DnnGraph::encode_graph(
