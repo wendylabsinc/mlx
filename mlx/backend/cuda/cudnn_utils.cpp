@@ -63,6 +63,26 @@ bool cudnn_autotune_enabled() {
   return enabled;
 }
 
+// Cap the per-plan cuDNN workspace considered while autotuning. Building ALL
+// candidate plans lets cuDNN pick (and benchmark) multi-GB Winograd/FFT plans
+// for the larger fp32 convs; allocating that workspace OOMs cudaMallocAsync.
+// Bounding it drops only those pathological plans — the fast small-workspace
+// tensor-core plans survive, so fp16 (workspaces well under the cap) is
+// unaffected. Tunable via MLX_CUDNN_MAX_WORKSPACE (bytes) for this device.
+int64_t cudnn_max_workspace() {
+  static int64_t bytes = []() -> int64_t {
+    if (const char* c = std::getenv("MLX_CUDNN_MAX_WORKSPACE")) {
+      char* end = nullptr;
+      long long v = std::strtoll(c, &end, 10);
+      if (end != c && v > 0) {
+        return static_cast<int64_t>(v);
+      }
+    }
+    return int64_t{1} << 30; // 1 GiB
+  }();
+  return bytes;
+}
+
 } // namespace
 
 fe::error_t DnnGraph::prepare() {
@@ -83,6 +103,12 @@ fe::error_t DnnGraph::prepare() {
 }
 
 fe::error_t DnnGraph::build() {
+  if (cudnn_autotune_enabled()) {
+    // Bound plan workspace before check_support(): for cuDNN 9.2+ the filter
+    // is applied at the engine-config stage there, so oversized (OOM-prone)
+    // plans are dropped before they can be built, autotuned, or selected.
+    deselect_workspace_greater_than(cudnn_max_workspace());
+  }
   RETURN_IF_ERROR(check_support(handle_));
   if (cudnn_autotune_enabled()) {
     // Build every candidate config; autotune_plans() picks the fastest.
