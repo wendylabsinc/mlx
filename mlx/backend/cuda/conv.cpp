@@ -372,13 +372,15 @@ void Convolution::eval_gpu(const std::vector<array>& inputs, array& out_) {
 
   if (graph) {
     register_args(encoder, backend_type, in, wt, out, out_);
-    CHECK_CUDNN_FE_ERROR(graph->encode_capturing(
-        encoder,
-        {
-            {'x', gpu_ptr<void>(in)},
-            {'w', gpu_ptr<void>(wt)},
-            {'y', gpu_ptr<void>(out)},
-        }));
+    std::unordered_map<int64_t, void*> variant_pack = {
+        {'x', gpu_ptr<void>(in)},
+        {'w', gpu_ptr<void>(wt)},
+        {'y', gpu_ptr<void>(out)},
+    };
+    // First time we see this shape: pick the fastest engine config (no-op
+    // unless MLX_CUDNN_AUTOTUNE is set). Must run before capture.
+    CHECK_CUDNN_FE_ERROR(graph->autotune_plans(encoder, variant_pack));
+    CHECK_CUDNN_FE_ERROR(graph->encode_capturing(encoder, variant_pack));
     conv_cache().emplace(
         cache_key, std::make_pair(backend_type, std::move(*graph)));
     return;

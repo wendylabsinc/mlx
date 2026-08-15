@@ -154,6 +154,13 @@ class DnnGraph : public fe::graph::Graph {
   // Call this after setting notes.
   fe::error_t build();
 
+  // Time all built plans with real inputs and select the fastest (opt-in via
+  // MLX_CUDNN_AUTOTUNE; a no-op otherwise). Call once per shape, before
+  // encode_capturing, since it runs eagerly outside CUDA-graph capture.
+  fe::error_t autotune_plans(
+      cu::CommandEncoder& encoder,
+      std::unordered_map<int64_t, void*> variant_pack);
+
   // Add cuDNN graph to CUDA graph, using native CUDA graph API.
   fe::error_t encode_graph(
       cu::CommandEncoder& encoder,
