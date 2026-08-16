@@ -63,27 +63,19 @@ bool cudnn_autotune_enabled() {
   return enabled;
 }
 
-// Cap the per-plan cuDNN workspace considered while autotuning. Building ALL
-// candidate plans lets cuDNN pick (and benchmark) multi-GB Winograd/FFT plans
-// for the larger fp32 convs; allocating that workspace OOMs cudaMallocAsync.
-// Bounding it drops only those pathological plans — the fast small-workspace
-// tensor-core plans survive, so fp16 (workspaces well under the cap) is
-// unaffected. Tunable via MLX_CUDNN_MAX_WORKSPACE (bytes) for this device.
-int64_t cudnn_max_workspace() {
-  static int64_t bytes = []() -> int64_t {
-    if (const char* c = std::getenv("MLX_CUDNN_MAX_WORKSPACE")) {
-      char* end = nullptr;
-      long long v = std::strtoll(c, &end, 10);
-      if (end != c && v > 0) {
-        return static_cast<int64_t>(v);
-      }
-    }
-    return int64_t{1} << 30; // 1 GiB
-  }();
-  return bytes;
-}
-
 } // namespace
+
+// Autotuning is opt-in (MLX_CUDNN_AUTOTUNE) and additionally skipped for
+// float32. On this unified-memory CUDA device (GB10) cudaMemGetInfo
+// underreports the memory pool, so building/timing ALL candidate plans for the
+// larger fp32 convs either OOMs cudaMallocAsync or crashes cuDNN when the plan
+// set is workspace-filtered. Bounding the workspace was tried and reproducibly
+// failed (loud OOM uncapped; silent cuDNN death when capped at 1 GiB and
+// 256 MiB), so fp32 falls back to the single heuristic plan — the same,
+// working path as autotune-off. fp16/bf16 (small workspaces) keep the win.
+bool DnnGraph::autotune_enabled() const {
+  return cudnn_autotune_enabled() && io_dtype_ != float32;
+}
 
 fe::error_t DnnGraph::prepare() {
   RETURN_IF_ERROR(validate());
@@ -93,7 +85,7 @@ fe::error_t DnnGraph::prepare() {
     // cuDNN bug: they did not catch all exceptions in the API.
     return {fe::error_code_t::CUDNN_BACKEND_API_FAILED, error.what()};
   }
-  if (cudnn_autotune_enabled()) {
+  if (autotune_enabled()) {
     RETURN_IF_ERROR(
         create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::B}));
   } else {
@@ -103,14 +95,8 @@ fe::error_t DnnGraph::prepare() {
 }
 
 fe::error_t DnnGraph::build() {
-  if (cudnn_autotune_enabled()) {
-    // Bound plan workspace before check_support(): for cuDNN 9.2+ the filter
-    // is applied at the engine-config stage there, so oversized (OOM-prone)
-    // plans are dropped before they can be built, autotuned, or selected.
-    deselect_workspace_greater_than(cudnn_max_workspace());
-  }
   RETURN_IF_ERROR(check_support(handle_));
-  if (cudnn_autotune_enabled()) {
+  if (autotune_enabled()) {
     // Build every candidate config; autotune_plans() picks the fastest.
     RETURN_IF_ERROR(build_plans(handle_, fe::BuildPlanPolicy_t::ALL));
   } else {
@@ -122,19 +108,14 @@ fe::error_t DnnGraph::build() {
 fe::error_t DnnGraph::autotune_plans(
     cu::CommandEncoder& encoder,
     std::unordered_map<int64_t, void*> variant_pack) {
-  if (!cudnn_autotune_enabled()) {
+  if (!autotune_enabled()) {
     return {};
   }
   // Time all built plans with the real inputs and select the fastest. Runs
   // eagerly on the stream (NOT inside CUDA-graph capture), so call this before
   // encode_capturing, once per shape (the result is held by the conv cache).
-  //
-  // get_autotune_workspace_size() sums the workspace of every built candidate
-  // plan; for large fp32 convs this can exceed device memory and the workspace
-  // allocation throws (cudaMallocAsync out of memory). If that happens, skip
-  // autotuning for this shape and fall back to the heuristic plan already
-  // selected by build_plans() — correct, just not benchmarked. fp16 convs have
-  // small workspaces and are unaffected.
+  // The try/catch keeps a workspace-allocation OOM from crashing: fall back to
+  // the heuristic plan already selected by build_plans().
   try {
     int64_t workspace_size = get_autotune_workspace_size();
     void* workspace_ptr = allocate_workspace(encoder, workspace_size);
