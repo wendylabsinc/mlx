@@ -63,25 +63,6 @@ bool cudnn_autotune_enabled() {
   return enabled;
 }
 
-// Cap (bytes) on the per-candidate cuDNN workspace considered during autotune.
-// autotune builds every candidate engine config and, before selecting, allocates
-// a workspace sized to the MAX across them (get_autotune_workspace_size) for
-// every conv shape in the warmup eval — that transient dominates the reported
-// GPU peak. Filtering out fat candidates before build bounds the transient (and
-// each candidate's own workspace) at the cost of possibly excluding a fast
-// large-workspace plan. 0 disables the cap (upstream behavior). Default 256 MiB
-// is comfortably above real conv workspaces here, so it trims outliers without
-// dropping the heuristic winner. Steady-state workspace is unaffected: it is
-// always the selected plan's (get_workspace_size), not this max.
-int64_t cudnn_autotune_workspace_cap() {
-  static int64_t cap = []() -> int64_t {
-    const char* c = std::getenv("MLX_CUDNN_AUTOTUNE_WS_MB");
-    int64_t mb = (c != nullptr) ? std::atoll(c) : 256;
-    return mb > 0 ? mb * (1024 * 1024) : 0;
-  }();
-  return cap;
-}
-
 } // namespace
 
 // Autotuning is opt-in (MLX_CUDNN_AUTOTUNE) and additionally skipped for
@@ -116,13 +97,7 @@ fe::error_t DnnGraph::prepare() {
 fe::error_t DnnGraph::build() {
   RETURN_IF_ERROR(check_support(handle_));
   if (autotune_enabled()) {
-    // Drop candidate plans whose workspace exceeds the cap before building, so
-    // neither the built set nor the autotune transient (max workspace across
-    // candidates) includes an outlier. Skipped if it would leave no plan.
-    if (int64_t cap = cudnn_autotune_workspace_cap(); cap > 0) {
-      deselect_workspace_greater_than(cap);
-    }
-    // Build every remaining candidate config; autotune_plans() picks the fastest.
+    // Build every candidate config; autotune_plans() picks the fastest.
     RETURN_IF_ERROR(build_plans(handle_, fe::BuildPlanPolicy_t::ALL));
   } else {
     RETURN_IF_ERROR(build_plans(handle_));
