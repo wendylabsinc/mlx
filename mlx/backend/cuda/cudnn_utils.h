@@ -88,7 +88,7 @@ inline std::array<typename Vec::value_type, NDIM> vector_key(const Vec& vec) {
 class DnnGraph : public fe::graph::Graph {
  public:
   DnnGraph(cudnnHandle_t handle, Dtype io_dtype, Dtype compute_dtype = float32)
-      : handle_(handle) {
+      : handle_(handle), io_dtype_(io_dtype) {
     set_io_data_type(dtype_to_cudnn_type(io_dtype));
     set_intermediate_data_type(dtype_to_cudnn_type(compute_dtype));
     set_compute_data_type(dtype_to_cudnn_type(compute_dtype));
@@ -154,6 +154,13 @@ class DnnGraph : public fe::graph::Graph {
   // Call this after setting notes.
   fe::error_t build();
 
+  // Time all built plans with real inputs and select the fastest (opt-in via
+  // MLX_CUDNN_AUTOTUNE; a no-op otherwise). Call once per shape, before
+  // encode_capturing, since it runs eagerly outside CUDA-graph capture.
+  fe::error_t autotune_plans(
+      cu::CommandEncoder& encoder,
+      std::unordered_map<int64_t, void*> variant_pack);
+
   // Add cuDNN graph to CUDA graph, using native CUDA graph API.
   fe::error_t encode_graph(
       cu::CommandEncoder& encoder,
@@ -164,6 +171,10 @@ class DnnGraph : public fe::graph::Graph {
       std::unordered_map<int64_t, void*> variant_pack);
 
  private:
+  // Whether to autotune this graph: opt-in via MLX_CUDNN_AUTOTUNE and skipped
+  // for float32 (see cudnn_utils.cpp for why).
+  bool autotune_enabled() const;
+
   void* prepare_workspace(cu::CommandEncoder& encoder);
 
   void set_tensor_attrs(
@@ -182,6 +193,7 @@ class DnnGraph : public fe::graph::Graph {
       const array& x);
 
   cudnnHandle_t handle_;
+  Dtype io_dtype_;
 };
 
 } // namespace mlx::core

@@ -1,4 +1,5 @@
 // Copyright © 2023-2024 Apple Inc.
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <sstream>
@@ -340,6 +341,13 @@ class CompilerCache {
       }
       return true;
     };
+    // Opt-in retrace diagnostics (MLX_COMPILE_TRACE_LOG=1): logs HIT/MISS per
+    // compiled fun_id and, on a miss, why each existing entry failed to match.
+    // A MISS on a warm, identical-input call is the retrace-per-call smoking
+    // gun; the reason string names the offending part of the cache key.
+    static const bool kTraceLog =
+        std::getenv("MLX_COMPILE_TRACE_LOG") != nullptr;
+
     // Loop over entries and check:
     // - Default stream and device match the entry's default stream
     // - Inputs match i.e. shapes and types must be equal.
@@ -356,7 +364,64 @@ class CompilerCache {
       // Check the inputs match and return if so
       if (has_same_shape_and_dtype(inputs, entry.inputs) &&
           constants == entry.constants) {
+        if (kTraceLog) {
+          fprintf(
+              stderr,
+              "[compile-cache] HIT  fun_id=%p entries=%zu ninputs=%zu\n",
+              reinterpret_cast<void*>(fun_id),
+              entries.size(),
+              inputs.size());
+        }
         return entry;
+      }
+    }
+    if (kTraceLog) {
+      fprintf(
+          stderr,
+          "[compile-cache] MISS fun_id=%p prior_entries=%zu ninputs=%zu shapeless=%d\n",
+          reinterpret_cast<void*>(fun_id),
+          entries.size(),
+          inputs.size(),
+          static_cast<int>(shapeless));
+      for (size_t e = 0; e < entries.size(); ++e) {
+        auto& entry = entries[e];
+        if (entry.stream != stream) {
+          fprintf(stderr, "  entry[%zu]: stream mismatch\n", e);
+          continue;
+        }
+        if (entry.shapeless != shapeless) {
+          fprintf(stderr, "  entry[%zu]: shapeless mismatch\n", e);
+          continue;
+        }
+        if (entry.inputs.size() != inputs.size()) {
+          fprintf(
+              stderr,
+              "  entry[%zu]: input count %zu vs %zu\n",
+              e,
+              entry.inputs.size(),
+              inputs.size());
+          continue;
+        }
+        if (constants != entry.constants) {
+          fprintf(stderr, "  entry[%zu]: constants mismatch\n", e);
+        }
+        for (size_t i = 0; i < inputs.size(); ++i) {
+          if (inputs[i].ndim() != entry.inputs[i].ndim()) {
+            fprintf(
+                stderr,
+                "  entry[%zu]: input[%zu] ndim %d vs %d\n",
+                e,
+                i,
+                static_cast<int>(inputs[i].ndim()),
+                static_cast<int>(entry.inputs[i].ndim()));
+          } else if (!shapeless && inputs[i].shape() != entry.inputs[i].shape()) {
+            fprintf(
+                stderr, "  entry[%zu]: input[%zu] shape mismatch\n", e, i);
+          } else if (inputs[i].dtype() != entry.inputs[i].dtype()) {
+            fprintf(
+                stderr, "  entry[%zu]: input[%zu] dtype mismatch\n", e, i);
+          }
+        }
       }
     }
     // Otherwise append a new cache entry

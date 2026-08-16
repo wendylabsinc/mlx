@@ -3,6 +3,9 @@
 #include "mlx/backend/cuda/cudnn_utils.h"
 #include "mlx/backend/cuda/device.h"
 
+#include <cstdlib>
+#include <string>
+
 namespace mlx::core {
 
 namespace {
@@ -47,7 +50,32 @@ inline auto nhwc_to_nchw(const array& x) {
   return std::make_tuple(std::move(shape), std::move(strides));
 }
 
+// Opt-in cuDNN plan autotuning (MLX_CUDNN_AUTOTUNE=1). Default off keeps the
+// upstream behavior (single heuristic-A plan). When on, we query more heuristic
+// modes, build every candidate engine config, and time them once per shape
+// (see DnnGraph::autotune_plans) so the fastest engine is chosen rather than
+// cuDNN's first heuristic pick — the equivalent of torch's cudnn.benchmark.
+bool cudnn_autotune_enabled() {
+  static bool enabled = []() {
+    const char* c = std::getenv("MLX_CUDNN_AUTOTUNE");
+    return c != nullptr && std::string(c) != "0";
+  }();
+  return enabled;
+}
+
 } // namespace
+
+// Autotuning is opt-in (MLX_CUDNN_AUTOTUNE) and additionally skipped for
+// float32. On this unified-memory CUDA device (GB10) cudaMemGetInfo
+// underreports the memory pool, so building/timing ALL candidate plans for the
+// larger fp32 convs either OOMs cudaMallocAsync or crashes cuDNN when the plan
+// set is workspace-filtered. Bounding the workspace was tried and reproducibly
+// failed (loud OOM uncapped; silent cuDNN death when capped at 1 GiB and
+// 256 MiB), so fp32 falls back to the single heuristic plan — the same,
+// working path as autotune-off. fp16/bf16 (small workspaces) keep the win.
+bool DnnGraph::autotune_enabled() const {
+  return cudnn_autotune_enabled() && io_dtype_ != float32;
+}
 
 fe::error_t DnnGraph::prepare() {
   RETURN_IF_ERROR(validate());
@@ -57,14 +85,47 @@ fe::error_t DnnGraph::prepare() {
     // cuDNN bug: they did not catch all exceptions in the API.
     return {fe::error_code_t::CUDNN_BACKEND_API_FAILED, error.what()};
   }
-  RETURN_IF_ERROR(create_execution_plans({fe::HeurMode_t::A}));
+  if (autotune_enabled()) {
+    RETURN_IF_ERROR(
+        create_execution_plans({fe::HeurMode_t::A, fe::HeurMode_t::B}));
+  } else {
+    RETURN_IF_ERROR(create_execution_plans({fe::HeurMode_t::A}));
+  }
   return {};
 }
 
 fe::error_t DnnGraph::build() {
   RETURN_IF_ERROR(check_support(handle_));
-  RETURN_IF_ERROR(build_plans(handle_));
+  if (autotune_enabled()) {
+    // Build every candidate config; autotune_plans() picks the fastest.
+    RETURN_IF_ERROR(build_plans(handle_, fe::BuildPlanPolicy_t::ALL));
+  } else {
+    RETURN_IF_ERROR(build_plans(handle_));
+  }
   return {};
+}
+
+fe::error_t DnnGraph::autotune_plans(
+    cu::CommandEncoder& encoder,
+    std::unordered_map<int64_t, void*> variant_pack) {
+  if (!autotune_enabled()) {
+    return {};
+  }
+  // Time all built plans with the real inputs and select the fastest. Runs
+  // eagerly on the stream (NOT inside CUDA-graph capture), so call this before
+  // encode_capturing, once per shape (the result is held by the conv cache).
+  // The try/catch keeps a workspace-allocation OOM from crashing: fall back to
+  // the heuristic plan already selected by build_plans().
+  try {
+    int64_t workspace_size = get_autotune_workspace_size();
+    void* workspace_ptr = allocate_workspace(encoder, workspace_size);
+    cudnnSetStream(handle_, encoder.stream());
+    return autotune(handle_, variant_pack, workspace_ptr);
+  } catch (const std::exception&) {
+    // OOM (or any failure) during autotuning: keep the heuristic plan already
+    // selected by build_plans(). Correct, just not benchmarked.
+    return {};
+  }
 }
 
 fe::error_t DnnGraph::encode_graph(
